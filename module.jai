@@ -1,3 +1,22 @@
+// Windows SOCKET (u64) ↔ s32-storage round-trip. Wait_Group stores socket
+// handles as s32 throughout (a Linux-shaped fd type). On Windows, SOCKETs
+// over 0x7FFFFFFF have the sign bit set when truncated to s32; casting
+// the s32 back to SOCKET with the default sign-extends produces a 64-bit
+// value totally unrelated to the original handle, which made WSAPoll
+// poll on a stale FD and ultimately crashed the proxy with
+// __cast_bounds_check_fail at module.jai:898. These helpers do
+// bit-preserving truncation + zero-extension so the round-trip is exact.
+// Use them at EVERY s32↔SOCKET boundary on Windows.
+#if OS == .WINDOWS {
+    _socket_to_s32 :: inline (sock: SOCKET) -> s32    { return cast,trunc(s32) (cast,trunc(u32) sock); }
+    _s32_to_socket :: inline (fd: s32)       -> SOCKET { return cast(SOCKET) (cast,trunc(u32) fd); }
+} else {
+    // POSIX: Socket is already s32 (the file descriptor). Identity helpers
+    // so call sites use the same name on every platform.
+    _socket_to_s32 :: inline (sock: Socket) -> s32    { return sock; }
+    _s32_to_socket :: inline (fd: s32)       -> Socket { return fd; }
+}
+
 Wait_Group :: struct {
     verbose: bool;
     #if OS == .MACOS {
@@ -150,8 +169,12 @@ init :: (group: *Wait_Group, verbose := false) -> success: bool {
             return false;
         }
 
-        group.wakeup_recv        = cast(s32) recv_sock;
-        group.wakeup_send        = cast(s32) send_sock;
+        // Bit-preserving narrow — wakeup sockets are created at init time
+        // and SHOULD have low values, but a process that's been up long
+        // enough can still see >0x7FFFFFFF and a plain cast(s32) would
+        // crash. Same helper / same reasoning as the client-socket path.
+        group.wakeup_recv        = _socket_to_s32(recv_sock);
+        group.wakeup_send        = _socket_to_s32(send_sock);
         group.wakeup_initialized = true;
     }
     return true;
@@ -170,8 +193,8 @@ deinit :: (group: *Wait_Group) {
     } else #if OS == .WINDOWS {
         if gSignalRecipient == group  _RestoreConsoleCtrlHandler();
 
-        if group.wakeup_recv >= 0  closesocket(cast(Socket) group.wakeup_recv);
-        if group.wakeup_send >= 0  closesocket(cast(Socket) group.wakeup_send);
+        if group.wakeup_recv >= 0  closesocket(_s32_to_socket(group.wakeup_recv));
+        if group.wakeup_send >= 0  closesocket(_s32_to_socket(group.wakeup_send));
         group.wakeup_recv = -1;
         group.wakeup_send = -1;
         if group.wakeup_initialized {
@@ -534,7 +557,7 @@ trigger_user_event :: (group: *Wait_Group, event_id: User_Event_Id) -> success: 
         unlock(*group.wakeup_mutex);
 
         b: u8 = 1;
-        sent := send(cast(Socket) group.wakeup_send, *b, 1, xx 0);
+        sent := send(_s32_to_socket(group.wakeup_send), *b, 1, xx 0);
         if sent != 1 {
             error_code, error_string := System.get_error_value_and_string();
             log_error("wait_group(windows): could not write wakeup byte: % %", error_code, error_string);
@@ -794,13 +817,13 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
 
         // Wakeup pipe is always first — handy when scanning for it.
         wpfd: pollfd;
-        wpfd.fd     = cast(SOCKET) group.wakeup_recv;
+        wpfd.fd     = _s32_to_socket(group.wakeup_recv);
         wpfd.events = cast(s16) POLLIN;
         array_add(*fds, wpfd);
 
         for fd_handler, fd_data: group.fd_handlers {
             pfd: pollfd;
-            pfd.fd = cast(SOCKET) fd_data.fd;
+            pfd.fd = _s32_to_socket(fd_data.fd);
             if #complete fd_data.event == {
                 case .READ;  pfd.events = cast(s16) POLLIN;
                 case .WRITE; pfd.events = cast(s16) POLLOUT;
@@ -865,7 +888,7 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
         if (fds[0].revents & cast(s16) POLLIN) != 0 {
             drain_buf: [256] u8;
             while true {
-                got := recv(cast(Socket) group.wakeup_recv, drain_buf.data, cast(s32) drain_buf.count, xx 0);
+                got := recv(_s32_to_socket(group.wakeup_recv), drain_buf.data, cast(s32) drain_buf.count, xx 0);
                 if got <= 0  break;
             }
 
@@ -895,7 +918,11 @@ wait_for_events :: (group: *Wait_Group, timeout_ms := -1) -> success: bool {
         for i: 1..fds.count - 1 {
             pfd := fds[i];
             if pfd.revents == 0  continue;
-            handle := cast(s32) pfd.fd;
+            // Windows: pfd.fd is SOCKET (u64). The s32 store is bit-
+            // preserving via _socket_to_s32; the inverse here recovers the
+            // same s32 we used as the table key. See helper at module top
+            // for the full sign-extension explanation.
+            handle := _socket_to_s32(pfd.fd);
 
             is_eof := (pfd.revents & cast(s16) (POLLHUP | POLLERR)) != 0;
 
@@ -1124,7 +1151,7 @@ remove_user_event_or_timer :: (group: *Wait_Group, event_id: User_Event_Id, $is_
             // next trigger and we don't have a way to surface failure here).
             if recipient.wakeup_send >= 0 {
                 b: u8 = 1;
-                send(cast(Socket) recipient.wakeup_send, *b, 1, xx 0);
+                send(_s32_to_socket(recipient.wakeup_send), *b, 1, xx 0);
             }
         }
         return 1;   // TRUE: consumed
